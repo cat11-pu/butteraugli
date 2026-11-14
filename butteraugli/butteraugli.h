@@ -79,6 +79,31 @@ bool ButteraugliInterface(const std::vector<ImageF> &rgb0,
                           ImageF &diffmap,
                           double &diffvalue);
 
+// Additive frequency-band scores. The units are the same as the scalar
+// Butteraugli score. low, mid and high sum to total.
+//
+// The bands follow the existing Gaussian frequency decomposition:
+//   low:  lf, nominal -3 dB cutoff at 0.025 cycles/pixel;
+//   mid:  mf + hf, nominal passband from 0.025 to 0.100 cycles/pixel;
+//   high: uhf, nominal -3 dB cutoff at 0.100 cycles/pixel.
+//
+// Band scores are calibrated from the peak error in each band so that their
+// sum equals the regular Butteraugli total. This preserves the existing total
+// score order while exposing how much each frequency range contributes.
+struct ButteraugliBandScores {
+  double low;
+  double mid;
+  double high;
+  double total;
+};
+
+// Computes the scalar Butteraugli score and its frequency-band split.
+// Returns true on success.
+bool ButteraugliBandInterface(const std::vector<ImageF> &rgb0,
+                              const std::vector<ImageF> &rgb1,
+                              float hf_asymmetry,
+                              ButteraugliBandScores &scores);
+
 const double kButteraugliQuantLow = 0.26;
 const double kButteraugliQuantHigh = 1.454;
 
@@ -437,6 +462,11 @@ class ButteraugliComparator {
   // Same as above, but the frequency decomposition was already applied.
   void DiffmapPsychoImage(const PsychoImage& ps1, ImageF &result) const;
 
+  void DiffmapBandEnergies(const PsychoImage& ps1,
+                           ImageF* BUTTERAUGLI_RESTRICT low,
+                           ImageF* BUTTERAUGLI_RESTRICT mid,
+                           ImageF* BUTTERAUGLI_RESTRICT high) const;
+
   void Mask(std::vector<ImageF>* BUTTERAUGLI_RESTRICT mask,
             std::vector<ImageF>* BUTTERAUGLI_RESTRICT mask_dc) const;
 
@@ -455,10 +485,9 @@ class ButteraugliComparator {
                     double normalization,
                     ImageF* BUTTERAUGLI_RESTRICT block_diff_ac) const;
 
-  ImageF CombineChannels(const std::vector<ImageF>& scale_xyb,
-                         const std::vector<ImageF>& scale_xyb_dc,
-                         const std::vector<ImageF>& block_diff_dc,
-                         const std::vector<ImageF>& block_diff_ac) const;
+  ImageF CombineBandChannels(
+      const std::vector<ImageF>& scale_xyb,
+      const std::vector<ImageF>& block_diff) const;
 
   const size_t xsize_;
   const size_t ysize_;

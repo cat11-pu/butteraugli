@@ -718,23 +718,24 @@ static void L2DiffAsymmetric(const ImageF& i0, const ImageF& i1,
   }
 }
 
+static BUTTERAUGLI_INLINE float DiffmapValue(float energy) {
+  static const float kInitialSlope = 100.0f;
+  return (energy < (1.0f / (kInitialSlope * kInitialSlope))
+              ? kInitialSlope * energy
+              : std::sqrt(energy));
+}
+
 // Making a cluster of local errors to be more impactful than
 // just a single error.
 ImageF CalculateDiffmap(const ImageF& diffmap_in) {
   PROFILER_FUNC;
   // Take square root.
   ImageF diffmap(diffmap_in.xsize(), diffmap_in.ysize());
-  static const float kInitialSlope = 100.0f;
   for (size_t y = 0; y < diffmap.ysize(); ++y) {
     const float* const BUTTERAUGLI_RESTRICT row_in = diffmap_in.Row(y);
     float* const BUTTERAUGLI_RESTRICT row_out = diffmap.Row(y);
     for (size_t x = 0; x < diffmap.xsize(); ++x) {
-      const float orig_val = row_in[x];
-      // TODO(b/29974893): Until that is fixed do not call sqrt on very small
-      // numbers.
-      row_out[x] = (orig_val < (1.0f / (kInitialSlope * kInitialSlope))
-                    ? kInitialSlope * orig_val
-                    : std::sqrt(orig_val));
+      row_out[x] = DiffmapValue(row_in[x]);
     }
   }
   return diffmap;
@@ -812,11 +813,39 @@ void ButteraugliComparator::DiffmapPsychoImage(const PsychoImage& pi1,
   if (xsize_ < 8 || ysize_ < 8) {
     return;
   }
-  std::vector<ImageF> block_diff_dc(3);
-  std::vector<ImageF> block_diff_ac(3);
+  ImageF low;
+  ImageF mid;
+  ImageF high;
+  DiffmapBandEnergies(pi1, &low, &mid, &high);
+
+  ImageF combined(xsize_, ysize_);
+  for (size_t y = 0; y < ysize_; ++y) {
+    const float* const BUTTERAUGLI_RESTRICT row_low = low.Row(y);
+    const float* const BUTTERAUGLI_RESTRICT row_mid = mid.Row(y);
+    const float* const BUTTERAUGLI_RESTRICT row_high = high.Row(y);
+    float* const BUTTERAUGLI_RESTRICT row_combined = combined.Row(y);
+    for (size_t x = 0; x < xsize_; ++x) {
+      row_combined[x] = row_low[x] + row_mid[x] + row_high[x];
+    }
+  }
+  result = CalculateDiffmap(combined);
+}
+
+void ButteraugliComparator::DiffmapBandEnergies(
+    const PsychoImage& pi1, ImageF* BUTTERAUGLI_RESTRICT low,
+    ImageF* BUTTERAUGLI_RESTRICT mid,
+    ImageF* BUTTERAUGLI_RESTRICT high) const {
+  PROFILER_FUNC;
+  if (xsize_ < 8 || ysize_ < 8) {
+    return;
+  }
+  std::vector<ImageF> block_diff_low(3);
+  std::vector<ImageF> block_diff_mid(3);
+  std::vector<ImageF> block_diff_high(3);
   for (int c = 0; c < 3; ++c) {
-    block_diff_dc[c] = ImageF(xsize_, ysize_, 0.0);
-    block_diff_ac[c] = ImageF(xsize_, ysize_, 0.0);
+    block_diff_low[c] = ImageF(xsize_, ysize_, 0.0);
+    block_diff_mid[c] = ImageF(xsize_, ysize_, 0.0);
+    block_diff_high[c] = ImageF(xsize_, ysize_, 0.0);
   }
 
   static const double wUhfMalta = 5.1409625726;
@@ -825,7 +854,7 @@ void ButteraugliComparator::DiffmapPsychoImage(const PsychoImage& pi1,
                wUhfMalta * hf_asymmetry_,
                wUhfMalta / hf_asymmetry_,
                norm1Uhf,
-               &block_diff_ac[1]);
+               &block_diff_high[1]);
 
   static const double wUhfMaltaX = 4.91743441556;
   static const double norm1UhfX = 687196.39002;
@@ -833,7 +862,7 @@ void ButteraugliComparator::DiffmapPsychoImage(const PsychoImage& pi1,
                wUhfMaltaX * hf_asymmetry_,
                wUhfMaltaX / hf_asymmetry_,
                norm1UhfX,
-               &block_diff_ac[0]);
+               &block_diff_high[0]);
 
   static const double wHfMalta = 153.671655716;
   static const double norm1Hf = 83150785.9592;
@@ -841,7 +870,7 @@ void ButteraugliComparator::DiffmapPsychoImage(const PsychoImage& pi1,
                  wHfMalta * sqrt(hf_asymmetry_),
                  wHfMalta / sqrt(hf_asymmetry_),
                  norm1Hf,
-                 &block_diff_ac[1]);
+                 &block_diff_mid[1]);
 
   static const double wHfMaltaX = 668.358918152;
   static const double norm1HfX = 0.882954368025;
@@ -849,17 +878,17 @@ void ButteraugliComparator::DiffmapPsychoImage(const PsychoImage& pi1,
                  wHfMaltaX * sqrt(hf_asymmetry_),
                  wHfMaltaX / sqrt(hf_asymmetry_),
                  norm1HfX,
-                 &block_diff_ac[0]);
+                 &block_diff_mid[0]);
 
   static const double wMfMalta = 6841.81248144;
   static const double norm1Mf = 0.0135134962487;
   MaltaDiffMapLF(pi0_.mf[1], pi1.mf[1], wMfMalta, wMfMalta, norm1Mf,
-                 &block_diff_ac[1]);
+                 &block_diff_mid[1]);
 
   static const double wMfMaltaX = 813.901703816;
   static const double norm1MfX = 16792.9322251;
   MaltaDiffMapLF(pi0_.mf[0], pi1.mf[0], wMfMaltaX, wMfMaltaX, norm1MfX,
-                 &block_diff_ac[0]);
+                 &block_diff_mid[0]);
 
   static const double wmul[9] = {
     0,
@@ -877,25 +906,26 @@ void ButteraugliComparator::DiffmapPsychoImage(const PsychoImage& pi1,
   static const double kSigmaHfX = 10.6666499623;
   static const double w = 884.809801415;
   SameNoiseLevels(pi0_.hf[1], pi1.hf[1], kSigmaHfX, w, maxclamp,
-                  &block_diff_ac[1]);
+                  &block_diff_mid[1]);
 
   for (int c = 0; c < 3; ++c) {
     if (c < 2) {
       L2DiffAsymmetric(pi0_.hf[c], pi1.hf[c],
                        wmul[c] * hf_asymmetry_,
                        wmul[c] / hf_asymmetry_,
-                       &block_diff_ac[c]);
+                       &block_diff_mid[c]);
     }
-    L2Diff(pi0_.mf[c], pi1.mf[c], wmul[3 + c], &block_diff_ac[c]);
-    L2Diff(pi0_.lf[c], pi1.lf[c], wmul[6 + c], &block_diff_dc[c]);
+    L2Diff(pi0_.mf[c], pi1.mf[c], wmul[3 + c], &block_diff_mid[c]);
+    L2Diff(pi0_.lf[c], pi1.lf[c], wmul[6 + c], &block_diff_low[c]);
   }
 
   std::vector<ImageF> mask_xyb;
   std::vector<ImageF> mask_xyb_dc;
   MaskPsychoImage(pi0_, pi1, xsize_, ysize_, &mask_xyb, &mask_xyb_dc);
 
-  result = CalculateDiffmap(
-      CombineChannels(mask_xyb, mask_xyb_dc, block_diff_dc, block_diff_ac));
+  *low = CombineBandChannels(mask_xyb_dc, block_diff_low);
+  *mid = CombineBandChannels(mask_xyb, block_diff_mid);
+  *high = CombineBandChannels(mask_xyb, block_diff_high);
 }
 
 // Allows PaddedMaltaUnit to call either function via overloading.
@@ -1585,27 +1615,21 @@ void ButteraugliComparator::MaltaDiffMapLF(
                                mulli, block_diff_ac);
 }
 
-ImageF ButteraugliComparator::CombineChannels(
-    const std::vector<ImageF>& mask_xyb,
-    const std::vector<ImageF>& mask_xyb_dc,
-    const std::vector<ImageF>& block_diff_dc,
-    const std::vector<ImageF>& block_diff_ac) const {
+ImageF ButteraugliComparator::CombineBandChannels(
+    const std::vector<ImageF>& scale_xyb,
+    const std::vector<ImageF>& block_diff) const {
   PROFILER_FUNC;
   ImageF result(xsize_, ysize_);
   for (size_t y = 0; y < ysize_; ++y) {
     float* const BUTTERAUGLI_RESTRICT row_out = result.Row(y);
     for (size_t x = 0; x < xsize_; ++x) {
       float mask[3];
-      float dc_mask[3];
-      float diff_dc[3];
-      float diff_ac[3];
+      float diff[3];
       for (int i = 0; i < 3; ++i) {
-        mask[i] = mask_xyb[i].Row(y)[x];
-        dc_mask[i] = mask_xyb_dc[i].Row(y)[x];
-        diff_dc[i] = block_diff_dc[i].Row(y)[x];
-        diff_ac[i] = block_diff_ac[i].Row(y)[x];
+        mask[i] = scale_xyb[i].Row(y)[x];
+        diff[i] = block_diff[i].Row(y)[x];
       }
-      row_out[x] = (DotProduct(diff_dc, dc_mask) + DotProduct(diff_ac, mask));
+      row_out[x] = DotProduct(diff, mask);
     }
   }
   return result;
@@ -1848,6 +1872,101 @@ void ButteraugliDiffmap(const std::vector<ImageF> &rgb0_image,
   }
   ButteraugliComparator butteraugli(rgb0_image, hf_asymmetry);
   butteraugli.Diffmap(rgb1_image, result_image);
+}
+
+static double ScoreFromEnergyMap(const ImageF& energy) {
+  float score = 0.0f;
+  for (size_t y = 0; y < energy.ysize(); ++y) {
+    const float* const BUTTERAUGLI_RESTRICT row = energy.Row(y);
+    for (size_t x = 0; x < energy.xsize(); ++x) {
+      score = std::max(score, DiffmapValue(row[x]));
+    }
+  }
+  return score;
+}
+
+bool ButteraugliBandInterface(const std::vector<ImageF> &rgb0,
+                              const std::vector<ImageF> &rgb1,
+                              float hf_asymmetry,
+                              ButteraugliBandScores &scores) {
+  scores.low = 0.0;
+  scores.mid = 0.0;
+  scores.high = 0.0;
+  scores.total = 0.0;
+  if (rgb0.size() < 3 || rgb1.size() < 3) {
+    return false;
+  }
+  const size_t xsize = rgb0[0].xsize();
+  const size_t ysize = rgb0[0].ysize();
+  if (xsize < 1 || ysize < 1) {
+    return false;
+  }
+  for (int i = 0; i < 3; ++i) {
+    if (rgb0[i].xsize() != xsize || rgb0[i].ysize() != ysize ||
+        rgb1[i].xsize() != xsize || rgb1[i].ysize() != ysize) {
+      return false;
+    }
+  }
+
+  static const int kMax = 8;
+  if (xsize < kMax || ysize < kMax) {
+    const int xborder = xsize < kMax ? (kMax - xsize) / 2 : 0;
+    const int yborder = ysize < kMax ? (kMax - ysize) / 2 : 0;
+    const size_t xscaled = std::max<size_t>(kMax, xsize);
+    const size_t yscaled = std::max<size_t>(kMax, ysize);
+    std::vector<ImageF> scaled0 = CreatePlanes<float>(xscaled, yscaled, 3);
+    std::vector<ImageF> scaled1 = CreatePlanes<float>(xscaled, yscaled, 3);
+    for (int c = 0; c < 3; ++c) {
+      for (size_t y = 0; y < yscaled; ++y) {
+        for (size_t x = 0; x < xscaled; ++x) {
+          const size_t x2 =
+              std::min<size_t>(xsize - 1, std::max<int>(0, x - xborder));
+          const size_t y2 =
+              std::min<size_t>(ysize - 1, std::max<int>(0, y - yborder));
+          scaled0[c].Row(y)[x] = rgb0[c].Row(y2)[x2];
+          scaled1[c].Row(y)[x] = rgb1[c].Row(y2)[x2];
+        }
+      }
+    }
+    return ButteraugliBandInterface(scaled0, scaled1, hf_asymmetry, scores);
+  }
+
+  ButteraugliComparator comparator(rgb0, hf_asymmetry);
+  PsychoImage pi1;
+  SeparateFrequencies(xsize, ysize, OpsinDynamicsImage(rgb1), pi1);
+  ImageF low_energy;
+  ImageF mid_energy;
+  ImageF high_energy;
+  comparator.DiffmapBandEnergies(pi1, &low_energy, &mid_energy, &high_energy);
+
+  const double low = ScoreFromEnergyMap(low_energy);
+  const double mid = ScoreFromEnergyMap(mid_energy);
+  const double high = ScoreFromEnergyMap(high_energy);
+  const double raw_sum = low + mid + high;
+
+  float total_score = 0.0f;
+  for (size_t y = 0; y < ysize; ++y) {
+    const float* const BUTTERAUGLI_RESTRICT row_low = low_energy.Row(y);
+    const float* const BUTTERAUGLI_RESTRICT row_mid = mid_energy.Row(y);
+    const float* const BUTTERAUGLI_RESTRICT row_high = high_energy.Row(y);
+    for (size_t x = 0; x < xsize; ++x) {
+      const float energy = row_low[x] + row_mid[x] + row_high[x];
+      total_score = std::max(total_score, DiffmapValue(energy));
+    }
+  }
+  const double total = total_score;
+
+  if (raw_sum > 0.0) {
+    scores.low = total * (low / raw_sum);
+    scores.mid = total * (mid / raw_sum);
+    scores.high = total * (high / raw_sum);
+  } else {
+    scores.low = 0.0;
+    scores.mid = 0.0;
+    scores.high = 0.0;
+  }
+  scores.total = scores.low + scores.mid + scores.high;
+  return true;
 }
 
 bool ButteraugliInterface(const std::vector<ImageF> &rgb0,

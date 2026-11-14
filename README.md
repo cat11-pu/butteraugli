@@ -35,6 +35,12 @@ map together with a scalar value defining the difference. The scalar value can
 be compared to two reference values that divide the value space into three
 experience classes: 'great', 'acceptable' and 'not acceptable'.
 
+For texture compression tuning, `ButteraugliBandInterface()` additionally
+returns additive low-, mid-, and high-frequency scores. Their sum equals the
+regular total, and the total preserves the existing score ordering. See
+[docs/banded_scores.md](docs/banded_scores.md) for the interface, exact band
+definition, and correlation data.
+
 ## Build instructions
 
 Install [Bazel](http://bazel.build) by following the

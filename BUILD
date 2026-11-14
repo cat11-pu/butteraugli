@@ -22,3 +22,10 @@ cc_binary(
         "@png_archive//:png",
     ],
 )
+
+cc_test(
+    name = "butteraugli_band_test",
+    srcs = ["butteraugli/butteraugli_band_test.cc"],
+    copts = ["-Wno-sign-compare"],
+    deps = [":butteraugli_lib"],
+)
