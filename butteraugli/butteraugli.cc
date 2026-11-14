@@ -196,8 +196,15 @@ ImageF Convolution(const ImageF& in,
     weight_no_border += kernel[j];
   }
   float scale_no_border = 1.0f / weight_no_border;
-  const int border1 = in.xsize() <= offset ? in.xsize() : offset;
-  const int border2 = in.xsize() - offset;
+  // Clamp the border ranges so that they stay valid for any image width,
+  // including widths smaller than the kernel radius. Without the clamp,
+  // "in.xsize() - offset" underflows (size_t arithmetic) and the resulting
+  // implementation-defined value makes the right-border loop read and write
+  // out of bounds for narrow images.
+  const int border1 = std::min<int>(in.xsize(), offset);
+  const int border2 = in.xsize() > static_cast<size_t>(offset)
+                          ? static_cast<int>(in.xsize() - offset)
+                          : border1;
   std::vector<float> scaled_kernel = kernel;
   for (int i = 0; i < scaled_kernel.size(); ++i) {
     scaled_kernel[i] *= scale_no_border;
@@ -1850,6 +1857,47 @@ void ButteraugliDiffmap(const std::vector<ImageF> &rgb0_image,
   butteraugli.Diffmap(rgb1_image, result_image);
 }
 
+// Returns true if any pixel value lies outside the valid linear intensity
+// range [0, 255]. NaN fails both comparisons, so it is detected as well.
+static bool ImageNeedsRangeClamp(const std::vector<ImageF> &rgb) {
+  for (size_t c = 0; c < rgb.size(); ++c) {
+    for (size_t y = 0; y < rgb[c].ysize(); ++y) {
+      const float *const BUTTERAUGLI_RESTRICT row = rgb[c].Row(y);
+      for (size_t x = 0; x < rgb[c].xsize(); ++x) {
+        if (!(row[x] >= 0.0f && row[x] <= 255.0f)) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+// Returns a copy of the image with all pixel values clamped to the valid
+// linear intensity range [0, 255]. NaN and negative values (including
+// -inf) map to 0, values above 255 (including +inf) map to 255.
+static std::vector<ImageF> ClampImageToValidRange(
+    const std::vector<ImageF> &rgb) {
+  std::vector<ImageF> clamped =
+      CreatePlanes<float>(rgb[0].xsize(), rgb[0].ysize(), rgb.size());
+  for (size_t c = 0; c < rgb.size(); ++c) {
+    for (size_t y = 0; y < rgb[c].ysize(); ++y) {
+      const float *const BUTTERAUGLI_RESTRICT row_in = rgb[c].Row(y);
+      float *const BUTTERAUGLI_RESTRICT row_out = clamped[c].Row(y);
+      for (size_t x = 0; x < rgb[c].xsize(); ++x) {
+        float v = row_in[x];
+        if (!(v >= 0.0f)) {
+          v = 0.0f;
+        } else if (v > 255.0f) {
+          v = 255.0f;
+        }
+        row_out[x] = v;
+      }
+    }
+  }
+  return clamped;
+}
+
 bool ButteraugliInterface(const std::vector<ImageF> &rgb0,
                           const std::vector<ImageF> &rgb1,
                           float hf_asymmetry,
@@ -1866,7 +1914,19 @@ bool ButteraugliInterface(const std::vector<ImageF> &rgb0,
       return false;  // Image planes must have same dimensions.
     }
   }
-  ButteraugliDiffmap(rgb0, rgb1, hf_asymmetry, diffmap);
+  // Pixel values outside the valid linear intensity range [0, 255] (in
+  // particular NaN and infinities) would escape the domain of the gamma
+  // polynomial and the mask lookup tables, overflowing the score to
+  // inf/NaN and even indexing the LUTs out of bounds. Clamp such inputs to
+  // the valid range (NaN maps to 0) so that any input yields a finite
+  // score. In-range inputs are passed through untouched.
+  if (ImageNeedsRangeClamp(rgb0) || ImageNeedsRangeClamp(rgb1)) {
+    std::vector<ImageF> clamped0 = ClampImageToValidRange(rgb0);
+    std::vector<ImageF> clamped1 = ClampImageToValidRange(rgb1);
+    ButteraugliDiffmap(clamped0, clamped1, hf_asymmetry, diffmap);
+  } else {
+    ButteraugliDiffmap(rgb0, rgb1, hf_asymmetry, diffmap);
+  }
   diffvalue = ButteraugliScoreFromDiffmap(diffmap);
   return true;
 }
