@@ -28,6 +28,12 @@ choosing compression formats. We don't know how well butteraugli performs with
 major deformations -- we have mostly tuned it within a small range of quality,
 roughly corresponding to jpeg qualities 90 to 95.
 
+For game textures, `ButteraugliRegionInterface` adds an optional region-aware
+score that separates smooth, gradient and noise areas and weights luma and
+chroma independently. The legacy interface and score scale are unchanged. See
+[docs/region_scores.md](docs/region_scores.md) for the API, weights and the
+500-group before/after benchmark.
+
 ## Interface
 
 Only a C++ interface is provided. The interface takes two images and outputs a

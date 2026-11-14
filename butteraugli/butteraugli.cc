@@ -141,10 +141,6 @@ static inline void CheckImage(const ImageF &image, const char *name) {
 static const double kInternalGoodQualityThreshold = 20.35;
 static const double kGlobalScale = 1.0 / kInternalGoodQualityThreshold;
 
-inline float DotProduct(const float u[3], const float v[3]) {
-  return u[0] * v[0] + u[1] * v[1] + u[2] * v[2];
-}
-
 std::vector<float> ComputeKernel(float sigma) {
   const float m = 2.25;  // Accuracy increases when m is increased.
   const float scaler = -1.0 / (2 * sigma * sigma);
@@ -718,23 +714,24 @@ static void L2DiffAsymmetric(const ImageF& i0, const ImageF& i1,
   }
 }
 
+static BUTTERAUGLI_INLINE float DiffmapValue(float energy) {
+  static const float kInitialSlope = 100.0f;
+  return energy < (1.0f / (kInitialSlope * kInitialSlope))
+             ? kInitialSlope * energy
+             : std::sqrt(energy);
+}
+
 // Making a cluster of local errors to be more impactful than
 // just a single error.
 ImageF CalculateDiffmap(const ImageF& diffmap_in) {
   PROFILER_FUNC;
   // Take square root.
   ImageF diffmap(diffmap_in.xsize(), diffmap_in.ysize());
-  static const float kInitialSlope = 100.0f;
   for (size_t y = 0; y < diffmap.ysize(); ++y) {
     const float* const BUTTERAUGLI_RESTRICT row_in = diffmap_in.Row(y);
     float* const BUTTERAUGLI_RESTRICT row_out = diffmap.Row(y);
     for (size_t x = 0; x < diffmap.xsize(); ++x) {
-      const float orig_val = row_in[x];
-      // TODO(b/29974893): Until that is fixed do not call sqrt on very small
-      // numbers.
-      row_out[x] = (orig_val < (1.0f / (kInitialSlope * kInitialSlope))
-                    ? kInitialSlope * orig_val
-                    : std::sqrt(orig_val));
+      row_out[x] = DiffmapValue(row_in[x]);
     }
   }
   return diffmap;
@@ -778,8 +775,8 @@ ButteraugliComparator::ButteraugliComparator(const std::vector<ImageF>& rgb0,
       num_pixels_(xsize_ * ysize_),
       hf_asymmetry_(hf_asymmetry) {
   if (xsize_ < 8 || ysize_ < 8) return;
-  std::vector<ImageF> xyb0 = OpsinDynamicsImage(rgb0);
-  SeparateFrequencies(xsize_, ysize_, xyb0, pi0_);
+  xyb0_ = OpsinDynamicsImage(rgb0);
+  SeparateFrequencies(xsize_, ysize_, xyb0_, pi0_);
 }
 
 void ButteraugliComparator::Mask(
@@ -808,6 +805,21 @@ void ButteraugliComparator::DiffmapOpsinDynamicsImage(
 
 void ButteraugliComparator::DiffmapPsychoImage(const PsychoImage& pi1,
                                                ImageF& result) const {
+  PROFILER_FUNC;
+  if (xsize_ < 8 || ysize_ < 8) {
+    return;
+  }
+  ImageF total(xsize_, ysize_);
+  ImageF luma;
+  ImageF chroma;
+  DiffmapComponentEnergies(pi1, &luma, &chroma, &total);
+  result = CalculateDiffmap(total);
+}
+
+void ButteraugliComparator::DiffmapComponentEnergies(
+    const PsychoImage& pi1, ImageF* BUTTERAUGLI_RESTRICT luma,
+    ImageF* BUTTERAUGLI_RESTRICT chroma,
+    ImageF* BUTTERAUGLI_RESTRICT total) const {
   PROFILER_FUNC;
   if (xsize_ < 8 || ysize_ < 8) {
     return;
@@ -894,8 +906,272 @@ void ButteraugliComparator::DiffmapPsychoImage(const PsychoImage& pi1,
   std::vector<ImageF> mask_xyb_dc;
   MaskPsychoImage(pi0_, pi1, xsize_, ysize_, &mask_xyb, &mask_xyb_dc);
 
-  result = CalculateDiffmap(
-      CombineChannels(mask_xyb, mask_xyb_dc, block_diff_dc, block_diff_ac));
+  *luma = ImageF(xsize_, ysize_, 0.0);
+  *chroma = ImageF(xsize_, ysize_, 0.0);
+  if (total != nullptr) {
+    *total = ImageF(xsize_, ysize_, 0.0);
+  }
+  for (size_t y = 0; y < ysize_; ++y) {
+    float* const BUTTERAUGLI_RESTRICT row_luma = luma->Row(y);
+    float* const BUTTERAUGLI_RESTRICT row_chroma = chroma->Row(y);
+    float* const BUTTERAUGLI_RESTRICT row_total =
+        total == nullptr ? nullptr : total->Row(y);
+    for (size_t x = 0; x < xsize_; ++x) {
+      float luma_energy = 0.0f;
+      float chroma_energy = 0.0f;
+      float total_energy = 0.0f;
+      for (int c = 0; c < 3; ++c) {
+        const float energy = block_diff_dc[c].Row(y)[x] *
+                                 mask_xyb_dc[c].Row(y)[x] +
+                             block_diff_ac[c].Row(y)[x] *
+                                 mask_xyb[c].Row(y)[x];
+        total_energy += energy;
+        if (c == 1) {
+          luma_energy += energy;
+        } else {
+          chroma_energy += energy;
+        }
+      }
+      row_luma[x] = luma_energy;
+      row_chroma[x] = chroma_energy;
+      if (row_total != nullptr) {
+        row_total[x] = total_energy;
+      }
+    }
+  }
+}
+
+static float SmoothStep(float lo, float hi, float value) {
+  if (value <= lo) return 0.0f;
+  if (value >= hi) return 1.0f;
+  const float t = (value - lo) / (hi - lo);
+  return t * t * (3.0f - 2.0f * t);
+}
+
+static double MeanTopFraction(std::vector<float>* values, double fraction) {
+  if (values->empty()) return 0.0;
+  size_t num = static_cast<size_t>(
+      std::ceil(fraction * static_cast<double>(values->size())));
+  num = std::max<size_t>(1, std::min(values->size(), num));
+  const size_t begin = values->size() - num;
+  std::nth_element(values->begin(), values->begin() + begin, values->end());
+  double sum = 0.0;
+  for (size_t i = begin; i < values->size(); ++i) {
+    sum += (*values)[i];
+  }
+  return sum / num;
+}
+
+static inline double IntegralAt(const std::vector<double>& integral,
+                                size_t stride, size_t x, size_t y) {
+  return integral[y * stride + x];
+}
+
+bool ButteraugliComparator::RegionScores(
+    const std::vector<ImageF>& rgb1,
+    const ButteraugliRegionWeights& input_weights,
+    ButteraugliRegionScores& scores) const {
+  PROFILER_FUNC;
+  scores.smooth = 0.0;
+  scores.gradient = 0.0;
+  scores.noise = 0.0;
+  scores.luma = 0.0;
+  scores.chroma = 0.0;
+  scores.total = 0.0;
+  if (xsize_ < 8 || ysize_ < 8) return false;
+
+  double region_mix[3] = {
+      std::max(0.0, input_weights.smooth),
+      std::max(0.0, input_weights.gradient),
+      std::max(0.0, input_weights.noise),
+  };
+  const double region_sum = region_mix[0] + region_mix[1] + region_mix[2];
+  if (!(region_sum > 0.0)) return false;
+  for (int i = 0; i < 3; ++i) region_mix[i] /= region_sum;
+
+  const double luma_weights[3] = {
+      std::min(1.0, std::max(0.0, input_weights.smooth_luma)),
+      std::min(1.0, std::max(0.0, input_weights.gradient_luma)),
+      std::min(1.0, std::max(0.0, input_weights.noise_luma)),
+  };
+
+  // Local gradient statistics are accumulated with integral images. A
+  // 5x5 window gives a stable smooth/gradient/noise split without another
+  // full-image Gaussian blur.
+  const int radius = 2;
+  const size_t stride = xsize_ + 1;
+  std::vector<double> trace_sum((xsize_ + 1) * (ysize_ + 1), 0.0);
+  std::vector<double> jdiff_sum((xsize_ + 1) * (ysize_ + 1), 0.0);
+  std::vector<double> jcross_sum((xsize_ + 1) * (ysize_ + 1), 0.0);
+  std::vector<float> activity(num_pixels_, 0.0f);
+  std::vector<float> coherence_values(num_pixels_, 0.0f);
+  for (size_t y = 0; y < ysize_; ++y) {
+    const float* const BUTTERAUGLI_RESTRICT row = xyb0_[1].Row(y);
+    const size_t y0 = y == 0 ? 0 : y - 1;
+    const size_t y1 = std::min(ysize_ - 1, y + 1);
+    for (size_t x = 0; x < xsize_; ++x) {
+      const size_t x0 = x == 0 ? 0 : x - 1;
+      const size_t x1 = std::min(xsize_ - 1, x + 1);
+      const double gx =
+          (row[x1] - row[x0]) / static_cast<double>(x1 - x0);
+      const double gy =
+          (xyb0_[1].Row(y1)[x] - xyb0_[1].Row(y0)[x]) /
+          static_cast<double>(y1 - y0);
+      const double trace_value = gx * gx + gy * gy;
+      const double jdiff_value = gx * gx - gy * gy;
+      const double jcross_value = 2.0 * gx * gy;
+      const size_t ix = x + 1;
+      const size_t iy = y + 1;
+      trace_sum[iy * stride + ix] =
+          trace_value + trace_sum[(iy - 1) * stride + ix] +
+          trace_sum[iy * stride + ix - 1] -
+          trace_sum[(iy - 1) * stride + ix - 1];
+      jdiff_sum[iy * stride + ix] =
+          jdiff_value + jdiff_sum[(iy - 1) * stride + ix] +
+          jdiff_sum[iy * stride + ix - 1] -
+          jdiff_sum[(iy - 1) * stride + ix - 1];
+      jcross_sum[iy * stride + ix] =
+          jcross_value + jcross_sum[(iy - 1) * stride + ix] +
+          jcross_sum[iy * stride + ix - 1] -
+          jcross_sum[(iy - 1) * stride + ix - 1];
+    }
+  }
+
+  for (size_t y = 0; y < ysize_; ++y) {
+    const size_t wy0 = y < radius ? 0 : y - radius;
+    const size_t wy1 = std::min(ysize_, y + radius + 1);
+    for (size_t x = 0; x < xsize_; ++x) {
+      const size_t wx0 = x < radius ? 0 : x - radius;
+      const size_t wx1 = std::min(xsize_, x + radius + 1);
+      const double area =
+          static_cast<double>((wx1 - wx0) * (wy1 - wy0));
+      const double trace =
+          IntegralAt(trace_sum, stride, wx1, wy1) -
+          IntegralAt(trace_sum, stride, wx0, wy1) -
+          IntegralAt(trace_sum, stride, wx1, wy0) +
+          IntegralAt(trace_sum, stride, wx0, wy0);
+      activity[y * xsize_ + x] =
+          static_cast<float>(std::sqrt(std::max(0.0, trace / area)));
+      const double jdiff =
+          IntegralAt(jdiff_sum, stride, wx1, wy1) -
+          IntegralAt(jdiff_sum, stride, wx0, wy1) -
+          IntegralAt(jdiff_sum, stride, wx1, wy0) +
+          IntegralAt(jdiff_sum, stride, wx0, wy0);
+      const double jcross =
+          IntegralAt(jcross_sum, stride, wx1, wy1) -
+          IntegralAt(jcross_sum, stride, wx0, wy1) -
+          IntegralAt(jcross_sum, stride, wx1, wy0) +
+          IntegralAt(jcross_sum, stride, wx0, wy0);
+      coherence_values[y * xsize_ + x] = static_cast<float>(
+          std::min(1.0, std::sqrt(jdiff * jdiff + jcross * jcross) /
+                            std::max(1e-12, trace)));
+    }
+  }
+
+  float max_activity = 0.0f;
+  for (size_t i = 0; i < activity.size(); ++i) {
+    max_activity = std::max(max_activity, activity[i]);
+  }
+  std::vector<uint32_t> activity_histogram(1024, 0);
+  if (max_activity > 0.0f) {
+    const float scale = 1023.0f / max_activity;
+    for (size_t i = 0; i < activity.size(); ++i) {
+      const size_t bin = static_cast<size_t>(activity[i] * scale);
+      ++activity_histogram[std::min<size_t>(1023, bin)];
+    }
+  }
+  const size_t low_count =
+      static_cast<size_t>(0.20f * static_cast<float>(num_pixels_));
+  const size_t high_count =
+      static_cast<size_t>(0.75f * static_cast<float>(num_pixels_));
+  size_t cumulative = 0;
+  size_t low_bin = 0;
+  size_t high_bin = 0;
+  for (size_t i = 0; i < activity_histogram.size(); ++i) {
+    cumulative += activity_histogram[i];
+    if (cumulative <= low_count) low_bin = i + 1;
+    if (cumulative <= high_count) high_bin = i + 1;
+  }
+  const float histogram_scale = max_activity / 1023.0f;
+  const float low_activity = low_bin * histogram_scale;
+  const float high_activity = high_bin * histogram_scale;
+  const float activity_lo = std::max(1e-4f, 0.35f * low_activity);
+  const float activity_hi =
+      std::max(1.5f * activity_lo, high_activity);
+
+  std::vector<uint8_t> regions(num_pixels_, 0);
+  size_t region_counts[3] = {0, 0, 0};
+  for (size_t i = 0; i < num_pixels_; ++i) {
+    const float textured =
+        SmoothStep(activity_lo, activity_hi, activity[i]);
+    const float coherent =
+        SmoothStep(0.25f, 0.75f, coherence_values[i]);
+    const float smooth = 1.0f - textured;
+    const float gradient = textured * coherent;
+    const float noise = textured * (1.0f - coherent);
+    uint8_t region = 0;
+    if (gradient >= smooth && gradient >= noise) {
+      region = 1;
+    } else if (noise > smooth) {
+      region = 2;
+    }
+    regions[i] = region;
+    ++region_counts[region];
+  }
+
+  PsychoImage pi1;
+  SeparateFrequencies(xsize_, ysize_, OpsinDynamicsImage(rgb1), pi1);
+  ImageF luma_energy;
+  ImageF chroma_energy;
+  DiffmapComponentEnergies(pi1, &luma_energy, &chroma_energy, nullptr);
+
+  std::vector<float> region_luma[3];
+  std::vector<float> region_chroma[3];
+  for (int region = 0; region < 3; ++region) {
+    region_luma[region].reserve(region_counts[region]);
+    region_chroma[region].reserve(region_counts[region]);
+  }
+  for (size_t y = 0; y < ysize_; ++y) {
+    const float* const BUTTERAUGLI_RESTRICT row_luma = luma_energy.Row(y);
+    const float* const BUTTERAUGLI_RESTRICT row_chroma =
+        chroma_energy.Row(y);
+    for (size_t x = 0; x < xsize_; ++x) {
+      const int region = regions[y * xsize_ + x];
+      region_luma[region].push_back(DiffmapValue(row_luma[x]));
+      region_chroma[region].push_back(DiffmapValue(row_chroma[x]));
+    }
+  }
+
+  double region_luma_score[3];
+  double region_chroma_score[3];
+  double region_scores[3];
+  static const double kRegionTopFraction = 0.25;
+  for (int region = 0; region < 3; ++region) {
+    region_luma_score[region] =
+        MeanTopFraction(&region_luma[region], kRegionTopFraction);
+    region_chroma_score[region] =
+        MeanTopFraction(&region_chroma[region], kRegionTopFraction);
+    region_scores[region] =
+        luma_weights[region] * region_luma_score[region] +
+        (1.0 - luma_weights[region]) * region_chroma_score[region];
+  }
+
+  // This score is intended for ranking texture-compression candidates. Its
+  // absolute scale is not mapped onto the legacy Butteraugli thresholds.
+  scores.smooth = region_mix[0] * region_scores[0];
+  scores.gradient = region_mix[1] * region_scores[1];
+  scores.noise = region_mix[2] * region_scores[2];
+  scores.luma = region_mix[0] * luma_weights[0] * region_luma_score[0] +
+                region_mix[1] * luma_weights[1] * region_luma_score[1] +
+                region_mix[2] * luma_weights[2] * region_luma_score[2];
+  scores.chroma =
+      region_mix[0] * (1.0 - luma_weights[0]) * region_chroma_score[0] +
+      region_mix[1] * (1.0 - luma_weights[1]) * region_chroma_score[1] +
+      region_mix[2] * (1.0 - luma_weights[2]) * region_chroma_score[2];
+  scores.total = scores.smooth + scores.gradient + scores.noise;
+  scores.luma = std::min(scores.luma, scores.total);
+  scores.chroma = scores.total - scores.luma;
+  return true;
 }
 
 // Allows PaddedMaltaUnit to call either function via overloading.
@@ -1585,32 +1861,6 @@ void ButteraugliComparator::MaltaDiffMapLF(
                                mulli, block_diff_ac);
 }
 
-ImageF ButteraugliComparator::CombineChannels(
-    const std::vector<ImageF>& mask_xyb,
-    const std::vector<ImageF>& mask_xyb_dc,
-    const std::vector<ImageF>& block_diff_dc,
-    const std::vector<ImageF>& block_diff_ac) const {
-  PROFILER_FUNC;
-  ImageF result(xsize_, ysize_);
-  for (size_t y = 0; y < ysize_; ++y) {
-    float* const BUTTERAUGLI_RESTRICT row_out = result.Row(y);
-    for (size_t x = 0; x < xsize_; ++x) {
-      float mask[3];
-      float dc_mask[3];
-      float diff_dc[3];
-      float diff_ac[3];
-      for (int i = 0; i < 3; ++i) {
-        mask[i] = mask_xyb[i].Row(y)[x];
-        dc_mask[i] = mask_xyb_dc[i].Row(y)[x];
-        diff_dc[i] = block_diff_dc[i].Row(y)[x];
-        diff_ac[i] = block_diff_ac[i].Row(y)[x];
-      }
-      row_out[x] = (DotProduct(diff_dc, dc_mask) + DotProduct(diff_ac, mask));
-    }
-  }
-  return result;
-}
-
 double ButteraugliScoreFromDiffmap(const ImageF& diffmap) {
   PROFILER_FUNC;
   float retval = 0.0f;
@@ -1848,6 +2098,64 @@ void ButteraugliDiffmap(const std::vector<ImageF> &rgb0_image,
   }
   ButteraugliComparator butteraugli(rgb0_image, hf_asymmetry);
   butteraugli.Diffmap(rgb1_image, result_image);
+}
+
+ButteraugliRegionWeights DefaultButteraugliRegionWeights() {
+  ButteraugliRegionWeights weights;
+  weights.smooth = 0.40;
+  weights.gradient = 0.30;
+  weights.noise = 0.30;
+  weights.smooth_luma = 0.75;
+  weights.gradient_luma = 0.65;
+  weights.noise_luma = 0.45;
+  return weights;
+}
+
+bool ButteraugliRegionInterface(
+    const std::vector<ImageF> &rgb0,
+    const std::vector<ImageF> &rgb1,
+    float hf_asymmetry,
+    const ButteraugliRegionWeights &weights,
+    ButteraugliRegionScores &scores) {
+  scores.smooth = 0.0;
+  scores.gradient = 0.0;
+  scores.noise = 0.0;
+  scores.luma = 0.0;
+  scores.chroma = 0.0;
+  scores.total = 0.0;
+  if (rgb0.size() < 3 || rgb1.size() < 3) return false;
+  const size_t xsize = rgb0[0].xsize();
+  const size_t ysize = rgb0[0].ysize();
+  if (xsize < 1 || ysize < 1) return false;
+  for (int i = 0; i < 3; ++i) {
+    if (rgb0[i].xsize() != xsize || rgb0[i].ysize() != ysize ||
+        rgb1[i].xsize() != xsize || rgb1[i].ysize() != ysize) {
+      return false;
+    }
+  }
+
+  if (xsize < 8 || ysize < 8) {
+    ImageF diffmap;
+    double total = 0.0;
+    if (!ButteraugliInterface(rgb0, rgb1, hf_asymmetry, diffmap, total)) {
+      return false;
+    }
+    scores.smooth = total;
+    scores.luma = total;
+    scores.total = total;
+    return true;
+  }
+
+  ButteraugliComparator comparator(rgb0, hf_asymmetry);
+  return comparator.RegionScores(rgb1, weights, scores);
+}
+
+bool ButteraugliRegionInterface(const std::vector<ImageF> &rgb0,
+                                const std::vector<ImageF> &rgb1,
+                                float hf_asymmetry,
+                                ButteraugliRegionScores &scores) {
+  return ButteraugliRegionInterface(
+      rgb0, rgb1, hf_asymmetry, DefaultButteraugliRegionWeights(), scores);
 }
 
 bool ButteraugliInterface(const std::vector<ImageF> &rgb0,

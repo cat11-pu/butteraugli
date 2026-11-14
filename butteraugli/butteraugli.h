@@ -79,6 +79,51 @@ bool ButteraugliInterface(const std::vector<ImageF> &rgb0,
                           ImageF &diffmap,
                           double &diffvalue);
 
+// Region-aware texture score. The image is split softly into smooth,
+// gradient and noise regions. Luma and chroma errors are aggregated
+// independently inside each region before the region scores are combined.
+//
+// The inputs use the same linear RGB planes and hf_asymmetry convention as
+// ButteraugliInterface. The output is non-negative and satisfies
+//   total == smooth + gradient + noise
+//   total == luma + chroma
+// The smooth/gradient/noise fields and the luma/chroma fields are therefore
+// two partitions of the same score.
+struct ButteraugliRegionScores {
+  double smooth;
+  double gradient;
+  double noise;
+  double luma;
+  double chroma;
+  double total;
+};
+
+// Per-region channel mixing. Region weights are normalized internally.
+// Luma weights are in [0, 1], and chroma receives 1 - luma.
+struct ButteraugliRegionWeights {
+  double smooth;
+  double gradient;
+  double noise;
+  double smooth_luma;
+  double gradient_luma;
+  double noise_luma;
+};
+
+ButteraugliRegionWeights DefaultButteraugliRegionWeights();
+
+bool ButteraugliRegionInterface(
+    const std::vector<ImageF> &rgb0,
+    const std::vector<ImageF> &rgb1,
+    float hf_asymmetry,
+    const ButteraugliRegionWeights &weights,
+    ButteraugliRegionScores &scores);
+
+// Uses DefaultButteraugliRegionWeights().
+bool ButteraugliRegionInterface(const std::vector<ImageF> &rgb0,
+                                const std::vector<ImageF> &rgb1,
+                                float hf_asymmetry,
+                                ButteraugliRegionScores &scores);
+
 const double kButteraugliQuantLow = 0.26;
 const double kButteraugliQuantHigh = 1.454;
 
@@ -437,6 +482,10 @@ class ButteraugliComparator {
   // Same as above, but the frequency decomposition was already applied.
   void DiffmapPsychoImage(const PsychoImage& ps1, ImageF &result) const;
 
+  bool RegionScores(const std::vector<ImageF>& rgb1,
+                    const ButteraugliRegionWeights& weights,
+                    ButteraugliRegionScores& scores) const;
+
   void Mask(std::vector<ImageF>* BUTTERAUGLI_RESTRICT mask,
             std::vector<ImageF>* BUTTERAUGLI_RESTRICT mask_dc) const;
 
@@ -455,15 +504,17 @@ class ButteraugliComparator {
                     double normalization,
                     ImageF* BUTTERAUGLI_RESTRICT block_diff_ac) const;
 
-  ImageF CombineChannels(const std::vector<ImageF>& scale_xyb,
-                         const std::vector<ImageF>& scale_xyb_dc,
-                         const std::vector<ImageF>& block_diff_dc,
-                         const std::vector<ImageF>& block_diff_ac) const;
+  void DiffmapComponentEnergies(
+      const PsychoImage& pi1,
+      ImageF* BUTTERAUGLI_RESTRICT luma,
+      ImageF* BUTTERAUGLI_RESTRICT chroma,
+      ImageF* BUTTERAUGLI_RESTRICT total) const;
 
   const size_t xsize_;
   const size_t ysize_;
   const size_t num_pixels_;
   float hf_asymmetry_;
+  std::vector<ImageF> xyb0_;
   PsychoImage pi0_;
 };
 
